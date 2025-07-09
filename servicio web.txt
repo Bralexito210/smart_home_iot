@@ -1,0 +1,273 @@
+from flask import Flask, request, jsonify
+import requests
+import threading
+import time
+import json
+
+app = Flask(__name__)
+
+# Variables globales
+ultimo_comando = {"d": "000000", "p": 0}
+datos_sensores = {}
+esp8266_ip = "192.168.18.18"  # IP del ESP8266 (ya corregida según tu configuración)
+
+# Mutex para thread safety
+lock = threading.Lock()
+
+@app.route('/datos', methods=['POST'])
+def recibir_datos():
+    global datos_sensores
+    try:
+        datos = request.get_json(force=True)
+        
+        with lock:
+            datos_sensores = {
+                "gas": datos.get("g", -1),
+                "distancia": datos.get("u", -1),
+                "leds": datos.get("d", "000000"),
+                "puerta": datos.get("p", 0),
+                "timestamp": time.time()
+            }
+        
+        print(f"Gas: {datos_sensores['gas']}")
+        print(f"Distancia: {datos_sensores['distancia']} cm")
+        print(f"LEDs: {datos_sensores['leds']}")
+        print(f"Puerta: {'Abierta' if datos_sensores['puerta'] else 'Cerrada'}")
+        
+        # Mostrar estado de apertura automática
+        if datos_sensores['distancia'] < 20 and datos_sensores['distancia'] > 0:
+            print("🚪 APERTURA AUTOMÁTICA ACTIVADA")
+        
+        print("-" * 40)
+        
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        print("Error al procesar JSON:", e)
+        return jsonify({"error": str(e)}), 400
+
+@app.route('/comando', methods=['GET', 'POST'])
+def comando():
+    global ultimo_comando
+    
+    if request.method == 'POST':
+        try:
+            datos = request.get_json()
+            
+            with lock:
+                ultimo_comando = {
+                    "d": datos.get("d", "000000"),
+                    "p": datos.get("p", 0)
+                }
+            
+            # Enviar comando al ESP8266
+            resultado = enviar_comando_esp8266(ultimo_comando)
+            
+            if resultado:
+                return jsonify({"status": "comando enviado exitosamente"})
+            else:
+                return jsonify({"status": "comando recibido, pero error al enviar a ESP8266"})
+                
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+            
+    elif request.method == 'GET':
+        with lock:
+            return jsonify(ultimo_comando)
+
+@app.route('/sensores', methods=['GET'])
+def obtener_sensores():
+    """Endpoint para obtener los últimos datos de sensores"""
+    with lock:
+        return jsonify(datos_sensores)
+
+@app.route('/control', methods=['POST'])
+def control_dispositivos():
+    """Endpoint más amigable para controlar dispositivos"""
+    try:
+        datos = request.get_json()
+        
+        # Procesar LEDs - manejar tanto string como array
+        leds_input = datos.get("leds", datos.get("d", [0,0,0,0,0,0]))
+        
+        if isinstance(leds_input, str):
+            # Si viene como string "111111", convertir a string
+            leds_str = leds_input.ljust(6, '0')[:6]  # Asegurar 6 caracteres
+        elif isinstance(leds_input, list):
+            # Si viene como array [1,1,1,1,1,1], convertir a string
+            leds_str = "".join(str(x) for x in leds_input)
+        else:
+            # Fallback
+            leds_str = "000000"
+            
+        # Procesar puerta
+        puerta = datos.get("puerta", datos.get("p", 0))
+        
+        comando = {
+            "d": leds_str,
+            "p": puerta
+        }
+        
+        with lock:
+            ultimo_comando = comando
+            
+        # Enviar al ESP8266
+        resultado = enviar_comando_esp8266(comando)
+        
+        if resultado:
+            return jsonify({
+                "status": "success",
+                "comando": comando,
+                "leds_procesados": leds_str,
+                "puerta_procesada": puerta,
+                "mensaje": "Dispositivos controlados exitosamente"
+            })
+        else:
+            return jsonify({
+                "status": "error",
+                "mensaje": "Error al comunicarse con ESP8266"
+            }), 500
+            
+    except Exception as e:
+        return jsonify({
+            "status": "error", 
+            "mensaje": str(e),
+            "datos_recibidos": request.get_json()
+        }), 400
+
+def enviar_comando_esp8266(comando):
+    """Enviar comando al ESP8266"""
+    try:
+        url = f"http://{esp8266_ip}/comando"
+        headers = {'Content-Type': 'application/json'}
+        
+        response = requests.post(url, json=comando, headers=headers, timeout=5)
+        
+        if response.status_code == 200:
+            print(f"Comando enviado al ESP8266: {comando}")
+            return True
+        else:
+            print(f"Error al enviar comando: {response.status_code}")
+            return False
+            
+    except requests.exceptions.RequestException as e:
+        print(f"Error de conexión con ESP8266: {e}")
+        return False
+
+@app.route('/test_leds', methods=['POST'])
+def test_leds():
+    """Endpoint para probar LEDs con diferentes formatos"""
+    try:
+        datos = request.get_json()
+        
+        # Mostrar qué formato recibimos
+        print(f"📧 Datos recibidos: {datos}")
+        
+        # Procesar LEDs
+        if "leds" in datos:
+            leds_input = datos["leds"]
+            print(f"🔍 LEDs input: {leds_input} (tipo: {type(leds_input)})")
+            
+            if isinstance(leds_input, str):
+                leds_str = leds_input.ljust(6, '0')[:6]
+                print(f"✅ String procesado: '{leds_str}'")
+            elif isinstance(leds_input, list):
+                leds_str = "".join(str(x) for x in leds_input)
+                print(f"✅ Array procesado: '{leds_str}'")
+            else:
+                leds_str = str(leds_input)
+                print(f"⚠️ Otro tipo procesado: '{leds_str}'")
+        else:
+            leds_str = "000000"
+            print("⚠️ No se encontraron LEDs, usando default")
+            
+        # Procesar puerta
+        puerta = datos.get("puerta", 0)
+        print(f"🚪 Puerta: {puerta}")
+        
+        comando = {
+            "d": leds_str,
+            "p": puerta
+        }
+        
+        return jsonify({
+            "status": "test_success",
+            "datos_originales": datos,
+            "comando_generado": comando,
+            "analisis": {
+                "leds_tipo": str(type(datos.get("leds", "No encontrado"))),
+                "leds_valor": datos.get("leds", "No encontrado"),
+                "leds_final": leds_str,
+                "puerta_valor": puerta
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "mensaje": str(e),
+            "datos_recibidos": request.get_json()
+        }), 400
+
+@app.route('/test', methods=['GET'])
+def test_conexion():
+    """Endpoint para probar la conexión"""
+    try:
+        url = f"http://{esp8266_ip}/status"
+        response = requests.get(url, timeout=5)
+        
+        if response.status_code == 200:
+            return jsonify({
+                "status": "success",
+                "esp8266": "online",
+                "datos_sensores": datos_sensores
+            })
+        else:
+            return jsonify({
+                "status": "error",
+                "esp8266": "offline"
+            }), 500
+            
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "mensaje": str(e)
+        }), 500
+
+def inicializar_servidor():
+    """Función para inicializar el servidor con información"""
+    print("=" * 50)
+    print("🚀 INICIANDO SERVIDOR FLASK")
+    print("=" * 50)
+    print(f"📡 ESP8266 IP configurada: {esp8266_ip}")
+    print(f"🌐 Servidor Flask: http://192.168.18.110:5000")
+    print()
+    print("📋 ENDPOINTS DISPONIBLES:")
+    print("  POST /datos - Recibe datos de sensores")
+    print("  GET/POST /comando - Maneja comandos")
+    print("  GET /sensores - Obtiene últimos datos")
+    print("  POST /control - Control amigable de dispositivos")
+    print("  GET /test - Prueba conexión")
+    print()
+    print("💡 EJEMPLOS DE USO:")
+    print("  curl -X GET http://192.168.18.110:5000/test")
+    print("  curl -X GET http://192.168.18.110:5000/sensores")
+    print("=" * 50)
+
+if __name__ == '__main__':
+    try:
+        inicializar_servidor()
+        
+        # Configuración más estable para desarrollo
+        app.run(
+            host='192.168.18.110', 
+            port=5000, 
+            debug=False,  # Cambiado a False para evitar problemas con watchdog
+            use_reloader=False,  # Desactivar auto-reload
+            threaded=True  # Habilitar multi-threading
+        )
+    except KeyboardInterrupt:
+        print("\n🛑 Servidor detenido por el usuario")
+    except Exception as e:
+        print(f"❌ Error al iniciar servidor: {e}")
+        import traceback
+        traceback.print_exc()
